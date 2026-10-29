@@ -27,6 +27,14 @@ type Chromium struct {
 	webResourceRequested  *iCoreWebView2WebResourceRequestedEventHandler
 	acceleratorKeyPressed *ICoreWebView2AcceleratorKeyPressedEventHandler
 	navigationCompleted   *ICoreWebView2NavigationCompletedEventHandler
+	// The handlers NavigationFilter needs, and the first error subscribing
+	// them (see navigationfilter.go).
+	navigationStarting  *ICoreWebView2NavigationStartingEventHandler
+	newWindowRequested  *ICoreWebView2NewWindowRequestedEventHandler
+	navigationFilterErr error
+	// webResourceRequestedHR is the result of the subscription to
+	// WebResourceRequested, which the document filter depends on.
+	webResourceRequestedHR uintptr
 
 	environment *ICoreWebView2Environment
 
@@ -42,6 +50,19 @@ type Chromium struct {
 	WebResourceRequestedCallback func(request *ICoreWebView2WebResourceRequest, args *ICoreWebView2WebResourceRequestedEventArgs)
 	NavigationCompletedCallback  func(sender *ICoreWebView2, args *ICoreWebView2NavigationCompletedEventArgs)
 	AcceleratorKeyCallback       func(uint) bool
+
+	// NavigationFilter, when set, decides which documents
+	// the webview may load. It is asked before every top-level navigation and
+	// each of its redirect hops, before the network request of every document,
+	// and before every popup; whatever it refuses is cancelled, answered
+	// locally with a 403, or not opened. Set it before Embed: if its handlers
+	// cannot be subscribed, Embed fails instead of running without them.
+	NavigationFilter func(Navigation) bool
+
+	// MessageSourceFilter, when set, receives the URI of
+	// the document that posted each web message; returning false drops the
+	// message before it reaches MessageCallback.
+	MessageSourceFilter func(source string) bool
 }
 
 func NewChromium() *Chromium {
@@ -64,6 +85,8 @@ func NewChromium() *Chromium {
 	e.webResourceRequested = newICoreWebView2WebResourceRequestedEventHandler(e)
 	e.acceleratorKeyPressed = newICoreWebView2AcceleratorKeyPressedEventHandler(e)
 	e.navigationCompleted = newICoreWebView2NavigationCompletedEventHandler(e)
+	e.navigationStarting = newICoreWebView2NavigationStartingEventHandler(e)
+	e.newWindowRequested = newICoreWebView2NewWindowRequestedEventHandler(e)
 	e.permissions = make(map[CoreWebView2PermissionKind]CoreWebView2PermissionState)
 
 	return e
@@ -108,6 +131,11 @@ func (e *Chromium) Embed(hwnd uintptr) bool {
 		}
 		_, _, _ = w32.User32TranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		_, _, _ = w32.User32DispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+	// Fail closed when the filter could not be armed.
+	if e.NavigationFilter != nil && e.navigationFilterErr != nil {
+		log.Printf("NavigationFilter not armed: %v", e.navigationFilterErr)
+		return false
 	}
 	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
 	return true
@@ -208,7 +236,8 @@ func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller
 		uintptr(unsafe.Pointer(e.permissionRequested)),
 		uintptr(unsafe.Pointer(&token)),
 	)
-	_, _, _ = e.webview.vtbl.AddWebResourceRequested.Call(
+	// registerNavigationFilter checks the result.
+	e.webResourceRequestedHR, _, _ = e.webview.vtbl.AddWebResourceRequested.Call(
 		uintptr(unsafe.Pointer(e.webview)),
 		uintptr(unsafe.Pointer(e.webResourceRequested)),
 		uintptr(unsafe.Pointer(&token)),
@@ -218,6 +247,11 @@ func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller
 		uintptr(unsafe.Pointer(e.navigationCompleted)),
 		uintptr(unsafe.Pointer(&token)),
 	)
+	// Before inited is set, so before Embed returns and anyone can call
+	// Navigate.
+	if e.NavigationFilter != nil {
+		e.registerNavigationFilter()
+	}
 
 	_ = e.controller.AddAcceleratorKeyPressed(e.acceleratorKeyPressed, &token)
 
@@ -231,6 +265,9 @@ func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller
 }
 
 func (e *Chromium) MessageReceived(sender *ICoreWebView2, args *iCoreWebView2WebMessageReceivedEventArgs) uintptr {
+	if e.MessageSourceFilter != nil && !e.messageSourceAllowed(args) {
+		return 0
+	}
 	var message *uint16
 	_, _, _ = args.vtbl.TryGetWebMessageAsString.Call(
 		uintptr(unsafe.Pointer(args)),
@@ -279,13 +316,21 @@ func (e *Chromium) PermissionRequested(_ *ICoreWebView2, args *iCoreWebView2Perm
 }
 
 func (e *Chromium) WebResourceRequested(sender *ICoreWebView2, args *ICoreWebView2WebResourceRequestedEventArgs) uintptr {
+	// The document filter reads the request on its own, by HRESULT.
+	// GetRequest below judges failure by the thread's last error and
+	// answers it with log.Fatal; with the filter on, this event fires for
+	// every document, so it is skipped when no callback needs the request.
+	if e.NavigationFilter != nil && e.documentRequestRefused(args) {
+		return 0
+	}
+	if e.WebResourceRequestedCallback == nil {
+		return 0
+	}
 	req, err := args.GetRequest()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if e.WebResourceRequestedCallback != nil {
-		e.WebResourceRequestedCallback(req, args)
-	}
+	e.WebResourceRequestedCallback(req, args)
 	return 0
 }
 
@@ -339,6 +384,20 @@ func boolToInt(input bool) int {
 func (e *Chromium) NavigationCompleted(sender *ICoreWebView2, args *ICoreWebView2NavigationCompletedEventArgs) uintptr {
 	if e.NavigationCompletedCallback != nil {
 		e.NavigationCompletedCallback(sender, args)
+	}
+	return 0
+}
+
+func (e *Chromium) NavigationStarting(sender *ICoreWebView2, args *ICoreWebView2NavigationStartingEventArgs) uintptr {
+	if e.NavigationFilter != nil {
+		e.filterNavigationStarting(args)
+	}
+	return 0
+}
+
+func (e *Chromium) NewWindowRequested(sender *ICoreWebView2, args *ICoreWebView2NewWindowRequestedEventArgs) uintptr {
+	if e.NavigationFilter != nil {
+		e.filterNewWindow(args)
 	}
 	return 0
 }

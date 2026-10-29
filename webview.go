@@ -81,7 +81,35 @@ type WebViewOptions struct {
 	// WindowOptions customizes the window that is created to embed the
 	// WebView2 widget.
 	WindowOptions WindowOptions
+
+	// NavigationFilter, when set, decides which documents
+	// the webview may load. It is asked before every top-level navigation and
+	// each hop of an HTTP redirect (Event NavigationEventStarting), before the
+	// network request of every document (NavigationEventDocumentRequest) and
+	// before every popup (NavigationEventNewWindow). Whatever it refuses is
+	// cancelled with the current page left in place, answered locally with a
+	// 403 so nothing reaches the network, or not opened. A URI that cannot be
+	// read is refused without asking, and NewWithOptions returns nil if the
+	// events the filter needs cannot be subscribed.
+	NavigationFilter func(nav Navigation) bool
+
+	// MessageSourceFilter, when set, receives the URI of
+	// the document behind every call to a bound function (see Bind) before it
+	// is dispatched. Returning false drops the call: its promise never settles.
+	MessageSourceFilter func(source string) bool
 }
+
+// The types of NavigationFilter, from the edge package.
+type (
+	Navigation      = edge.Navigation
+	NavigationEvent = edge.NavigationEvent
+)
+
+const (
+	NavigationEventStarting        = edge.NavigationEventStarting
+	NavigationEventDocumentRequest = edge.NavigationEventDocumentRequest
+	NavigationEventNewWindow       = edge.NavigationEventNewWindow
+)
 
 // New creates a new webview in a new window.
 func New(debug bool) WebView { return NewWithOptions(WebViewOptions{Debug: debug}) }
@@ -103,6 +131,8 @@ func NewWithOptions(options WebViewOptions) WebView {
 	chromium.MessageCallback = w.msgcb
 	chromium.DataPath = options.DataPath
 	chromium.SetPermission(edge.CoreWebView2PermissionKindClipboardRead, edge.CoreWebView2PermissionStateAllow)
+	chromium.NavigationFilter = options.NavigationFilter
+	chromium.MessageSourceFilter = options.MessageSourceFilter
 
 	w.browser = chromium
 	w.mainthread, _, _ = w32.Kernel32GetCurrentThreadID.Call()
